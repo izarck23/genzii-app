@@ -1,0 +1,5 @@
+/build
+.env
+.env.*
+*.env
+local.properties

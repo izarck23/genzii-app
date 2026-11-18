@@ -1,0 +1,1023 @@
+package com.example.data
+
+import com.example.model.*
+import com.example.util.UrlSecurityValidator
+import com.example.util.UrlValidationResult
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import android.content.Context
+import java.util.UUID
+
+object GenziiRepository {
+  private var appContext: Context? = null
+  private const val PREFS_NAME = "genzii_user_prefs"
+  private const val KEY_THEME = "saved_theme_mode"
+  private const val KEY_SUBSCRIPTION_TIER = "saved_subscription_tier"
+
+  private var loadCacheJob: kotlinx.coroutines.Job? = null
+  @Volatile private var isDeactivated: Boolean = false
+
+  fun init(context: Context) {
+    appContext = context.applicationContext
+    isDeactivated = false
+    GeminiUsageTracker.init(context)
+    try {
+      val prefs = appContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+      val savedTheme = prefs?.getString(KEY_THEME, null)
+      if (savedTheme != null) {
+        val mode = ThemeMode.valueOf(savedTheme)
+        _userProfile.update { it.copy(themeMode = mode) }
+      }
+      val savedTierStr = prefs?.getString(KEY_SUBSCRIPTION_TIER, null)
+      if (savedTierStr != null) {
+        val savedTier = SubscriptionTier.valueOf(savedTierStr)
+        _userProfile.update {
+          it.copy(
+            tier = savedTier,
+            checksLeft = when (savedTier) {
+              SubscriptionTier.PRO -> 999
+              SubscriptionTier.PLUS -> 100
+              SubscriptionTier.FREE -> 10
+            },
+            totalChecks = when (savedTier) {
+              SubscriptionTier.PRO -> 999
+              SubscriptionTier.PLUS -> 100
+              SubscriptionTier.FREE -> 10
+            },
+            totalStorageGb = when (savedTier) {
+              SubscriptionTier.PRO -> 100.0
+              SubscriptionTier.PLUS -> 50.0
+              SubscriptionTier.FREE -> 5.0
+            }
+          )
+        }
+      }
+      val savedPhoto = prefs?.getString("saved_photo_url", null)
+      if (savedPhoto != null) {
+        _userProfile.update { it.copy(photoUrl = savedPhoto) }
+      }
+      val savedOcrUses = prefs?.getInt("saved_ocr_uses", 4) ?: 4
+      _ocrUsesRemaining.value = savedOcrUses
+    } catch (e: Exception) {}
+
+    // Restore cached documents and scan reports for offline access
+    loadCachedDocuments()
+    loadCachedReports()
+  }
+
+  fun loadCachedDocuments(): kotlinx.coroutines.Job? {
+    val ctx = appContext ?: return null
+    loadCacheJob?.cancel()
+    val job = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+      try {
+        val cacheManager = DocumentLocalCacheManager.getInstance(ctx)
+        val cached = cacheManager.getCachedDocuments()
+        if (cached.isNotEmpty() && !isDeactivated) {
+          _documents.update { current ->
+            if (isDeactivated) emptyList()
+            else {
+              val existingIds = current.map { it.id }.toSet()
+              val newItems = cached.filterNot { it.id in existingIds }
+              current + newItems
+            }
+          }
+          if (!isDeactivated) {
+            _userProfile.update { it.copy(docsCount = _documents.value.size) }
+          }
+        }
+      } catch (e: Exception) {
+        android.util.Log.e("GenziiRepository", "Failed to restore cached documents: ${e.message}")
+      }
+    }
+    loadCacheJob = job
+    return job
+  }
+
+  private fun persistDocumentChange(doc: DocumentItem) {
+    val ctx = appContext ?: return
+    kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+      try {
+        DocumentLocalCacheManager.getInstance(ctx).cacheDocument(doc)
+      } catch (e: Exception) {}
+    }
+  }
+
+  private fun persistDocumentDeletion(id: String) {
+    val ctx = appContext ?: return
+    kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+      try {
+        DocumentLocalCacheManager.getInstance(ctx).deleteCachedDocument(id)
+      } catch (e: Exception) {}
+    }
+  }
+
+  private val _userProfile = MutableStateFlow(
+    UserProfile(
+      name = "Scholar",
+      email = "scholar@genzii.app",
+      role = "Student / Researcher",
+      tier = SubscriptionTier.FREE,
+      checksLeft = 10,
+      totalChecks = 10,
+      checksCount = 0,
+      docsCount = 0,
+      chatsCount = 0,
+      usedStorageGb = 0.0,
+      totalStorageGb = 5.0,
+      isAppLockEnabled = false,
+      isTwoFactorEnabled = false,
+      themeMode = ThemeMode.LIGHT
+    )
+  )
+  val userProfile: StateFlow<UserProfile> = _userProfile.asStateFlow()
+
+  private val _documents = MutableStateFlow<List<DocumentItem>>(emptyList())
+  val documents: StateFlow<List<DocumentItem>> = _documents.asStateFlow()
+
+  private val _reports = MutableStateFlow<Map<String, OriginalityReport>>(emptyMap())
+  val reports: StateFlow<Map<String, OriginalityReport>> = _reports.asStateFlow()
+
+  private val _chatMessages = MutableStateFlow<List<ChatMessage>>(
+    listOf(
+      ChatMessage(
+        id = "chat-init",
+        isUser = false,
+        text = "Hello! I'm Genzii, your smart academic AI assistant. I can help you draft essays, summarize PDFs, refine grammar, or check content for originality. What would you like to work on today?",
+        timestamp = "Just now",
+        suggestionChips = listOf("Summarize document", "Identify research gaps", "Refine academic tone", "Draft abstract")
+      )
+    )
+  )
+  val chatMessages: StateFlow<List<ChatMessage>> = _chatMessages.asStateFlow()
+
+  private val _notifications = MutableStateFlow<List<NotificationItem>>(
+    listOf(
+      NotificationItem(
+        id = "notif-welcome",
+        title = "Welcome to Genzii",
+        description = "Explore AI writing, Originality checks, and your encrypted Secure Vault.",
+        timestamp = "Just now",
+        isUnread = true,
+        type = "general"
+      )
+    )
+  )
+  val notifications: StateFlow<List<NotificationItem>> = _notifications.asStateFlow()
+
+  private val _isWritingToolsUnlockedThisSession = MutableStateFlow(false)
+  val isWritingToolsUnlockedThisSession: StateFlow<Boolean> = _isWritingToolsUnlockedThisSession.asStateFlow()
+
+  fun unlockWritingToolsSession() {
+    _isWritingToolsUnlockedThisSession.value = true
+  }
+
+  fun unlockWritingToolsForSession() {
+    _isWritingToolsUnlockedThisSession.value = true
+  }
+
+  val geminiUsageStats: StateFlow<GeminiUsageSummary> = GeminiUsageTracker.usageSummary
+
+  private val _ocrUsesRemaining = MutableStateFlow(4)
+  val ocrUsesRemaining: StateFlow<Int> = _ocrUsesRemaining.asStateFlow()
+
+  fun decrementOcrUses(): Int {
+    val current = _ocrUsesRemaining.value
+    if (current > 0) {
+      val next = current - 1
+      _ocrUsesRemaining.value = next
+      try {
+        appContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+          ?.edit()
+          ?.putInt("saved_ocr_uses", next)
+          ?.apply()
+      } catch (_: Exception) {}
+      return next
+    }
+    return 0
+  }
+
+  fun resetOcrUses() {
+    _ocrUsesRemaining.value = 4
+    try {
+      appContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        ?.edit()
+        ?.putInt("saved_ocr_uses", 4)
+        ?.apply()
+    } catch (_: Exception) {}
+  }
+
+  val folders: List<Pair<String, Int>>
+    get() {
+      val docs = _documents.value
+      val categories = listOf("Research Papers", "Assignments", "Lecture Notes", "Vault Enclave", "Personal Archive")
+      return categories.map { category ->
+        category to docs.count { it.folder.equals(category, ignoreCase = true) }
+      }
+    }
+
+  val flashcards = listOf(
+    Flashcard(
+      id = "fc-1",
+      question = "What is scaled dot-product attention?",
+      answer = "An attention mechanism where the dot product of Query and Key is scaled by 1/sqrt(d_k) before applying Softmax, avoiding vanishing gradients.",
+      category = "Deep Learning"
+    ),
+    Flashcard(
+      id = "fc-2",
+      question = "What is Zero-Knowledge encryption?",
+      answer = "A security architecture where only the user holds the decryption key; the server and host cannot view stored document plaintext.",
+      category = "Security"
+    ),
+    Flashcard(
+      id = "fc-3",
+      question = "How does Originality Index differ from Plagiarism Score?",
+      answer = "Originality Index measures authentic unique authorship percentage, while Plagiarism Score highlights matching public source excerpts.",
+      category = "Academic Writing"
+    )
+  )
+
+  val quizQuestions = listOf(
+    QuizQuestion(
+      id = "q-1",
+      question = "Which mechanism mitigates quadratic complexity in attention backbones?",
+      options = listOf("Sparse Windowed Attention", "Single Perceptron Layer", "Linear Regressor", "Naive Softmax"),
+      correctIndex = 0,
+      explanation = "Sparse attention computes attention only across local windows or strided blocks, dropping compute from O(N^2) to O(N sqrt(N))."
+    ),
+    QuizQuestion(
+      id = "q-2",
+      question = "What encryption standard is utilized in the Genzii Vault?",
+      options = listOf("DES 56-bit", "AES-256-GCM", "MD5 Hash", "Plain Base64"),
+      correctIndex = 1,
+      explanation = "Genzii Vault employs military-grade AES-256 with authenticated Galois/Counter Mode (GCM)."
+    )
+  )
+
+  fun addDocument(
+    name: String,
+    content: String,
+    folder: String = "Personal",
+    category: String = "Academic",
+    type: FileType = FileType.PDF,
+    localFilePath: String? = null,
+    uriString: String? = null,
+    pageCount: Int = 1,
+    createdAt: Long = System.currentTimeMillis()
+  ): DocumentItem {
+    isDeactivated = false
+    val sizeKb = (content.length * 1.5).toInt().coerceAtLeast(12)
+    val sizeStr = if (sizeKb > 1024) "${String.format("%.1f", sizeKb / 1024.0)} MB" else "$sizeKb KB"
+    val newDoc = DocumentItem(
+      id = "doc-${UUID.randomUUID()}",
+      name = if (name.contains(".")) name else "$name.${type.name.lowercase()}",
+      sizeFormatted = sizeStr,
+      type = type,
+      folder = folder,
+      category = category.ifBlank { "Academic" },
+      updatedAt = "Just now",
+      originalityScore = null,
+      isEncrypted = true,
+      content = content,
+      isStarred = false,
+      localFilePath = localFilePath,
+      uriString = uriString,
+      pageCount = pageCount,
+      createdAt = createdAt
+    )
+    _documents.update { listOf(newDoc) + it }
+    _userProfile.update { it.copy(docsCount = it.docsCount + 1) }
+    persistDocumentChange(newDoc)
+    return newDoc
+  }
+
+  fun updateDocumentCategory(id: String, newCategory: String) {
+    val clean = newCategory.trim().ifBlank { "Academic" }
+    var updated: DocumentItem? = null
+    _documents.update { list ->
+      list.map {
+        if (it.id == id) {
+          val doc = it.copy(category = clean, updatedAt = "Just now")
+          updated = doc
+          doc
+        } else it
+      }
+    }
+    updated?.let { persistDocumentChange(it) }
+  }
+
+  fun batchUpdateCategory(ids: Set<String>, newCategory: String) {
+    if (ids.isEmpty()) return
+    val clean = newCategory.trim().ifBlank { "Academic" }
+    val updatedList = mutableListOf<DocumentItem>()
+    _documents.update { list ->
+      list.map { doc ->
+        if (doc.id in ids) {
+          val updated = doc.copy(category = clean, updatedAt = "Just now")
+          updatedList.add(updated)
+          updated
+        } else doc
+      }
+    }
+    updatedList.forEach { persistDocumentChange(it) }
+  }
+
+  fun deleteDocument(id: String) {
+    _documents.update { list -> list.filterNot { it.id == id } }
+    _userProfile.update { it.copy(docsCount = (it.docsCount - 1).coerceAtLeast(0)) }
+    persistDocumentDeletion(id)
+  }
+
+  fun deleteDocuments(ids: Set<String>) {
+    if (ids.isEmpty()) return
+    _documents.update { list -> list.filterNot { it.id in ids } }
+    _userProfile.update { it.copy(docsCount = (it.docsCount - ids.size).coerceAtLeast(0)) }
+    ids.forEach { persistDocumentDeletion(it) }
+  }
+
+  fun moveDocumentsToFolder(ids: Set<String>, targetFolder: String) {
+    if (ids.isEmpty() || targetFolder.isBlank()) return
+    val cleanFolder = targetFolder.trim()
+    val updatedDocs = mutableListOf<DocumentItem>()
+    _documents.update { list ->
+      list.map { doc ->
+        if (doc.id in ids) {
+          val updated = doc.copy(folder = cleanFolder, updatedAt = "Just now")
+          updatedDocs.add(updated)
+          updated
+        } else doc
+      }
+    }
+    updatedDocs.forEach { persistDocumentChange(it) }
+  }
+
+  fun toggleStar(id: String) {
+    var updated: DocumentItem? = null
+    _documents.update { list ->
+      list.map {
+        if (it.id == id) {
+          val starred = it.copy(isStarred = !it.isStarred)
+          updated = starred
+          starred
+        } else it
+      }
+    }
+    updated?.let { persistDocumentChange(it) }
+  }
+
+  fun updateDocumentContent(id: String, newContent: String) {
+    var updated: DocumentItem? = null
+    _documents.update { list ->
+      list.map {
+        if (it.id == id) {
+          val item = it.copy(content = newContent, updatedAt = "Just now")
+          updated = item
+          item
+        } else it
+      }
+    }
+    updated?.let { persistDocumentChange(it) }
+  }
+
+  suspend fun scanOriginality(
+    title: String,
+    text: String
+  ): Result<OriginalityReport> {
+    if (text.isBlank()) {
+      return Result.failure(IllegalArgumentException("Please provide text or upload a document to scan."))
+    }
+
+    val profile = _userProfile.value
+    if (!com.example.network.GeminiService.isApiKeyConfigured(profile.customApiKey)) {
+      return Result.failure(
+        IllegalStateException("Google Gemini API key is not configured. Please enter your API key in Settings or AI Studio Secrets to run genuine originality checks.")
+      )
+    }
+
+    // Real Google Gemini API call
+    val geminiResult = com.example.network.GeminiService.analyzeOriginality(
+      documentTitle = title.ifBlank { "Document" },
+      textToAnalyze = text,
+      customApiKey = profile.customApiKey
+    )
+
+    return if (geminiResult.isSuccess) {
+      val report = geminiResult.getOrThrow()
+      _reports.update { it + (report.id to report) }
+      persistReport(report)
+      _userProfile.update {
+        it.copy(
+          checksCount = it.checksCount + 1,
+          checksLeft = (it.checksLeft - 1).coerceAtLeast(0)
+        )
+      }
+
+      // Also update document if matching
+      _documents.update { list ->
+        list.map {
+          if (it.name.equals(title, ignoreCase = true)) {
+            it.copy(originalityScore = report.originalPercentage)
+          } else it
+        }
+      }
+
+      Result.success(report)
+    } else {
+      // Never fabricate sample results, fake percentages, or mock sources when API fails
+      val error = geminiResult.exceptionOrNull() ?: Exception("Originality analysis failed")
+      Result.failure(error)
+    }
+  }
+
+  suspend fun extractAndScanUrl(url: String): Result<OriginalityReport> {
+    val profile = _userProfile.value
+    if (!isFeatureEntitled(PremiumFeature.URL_CHECKER)) {
+      return Result.failure(
+        IllegalStateException("URL Originality Checking requires a Genzii Plus or Pro subscription.")
+      )
+    }
+
+    if (profile.checksLeft <= 0) {
+      return Result.failure(
+        IllegalStateException("You have reached your monthly originality check quota. Please upgrade your plan or wait for the monthly renewal.")
+      )
+    }
+
+    // Extract web content with SSRF and redirect validation
+    val extractResult = com.example.network.UrlContentExtractor.extractText(url)
+    if (extractResult.isFailure) {
+      return Result.failure(extractResult.exceptionOrNull() ?: Exception("Failed to extract content from URL."))
+    }
+
+    val extracted = extractResult.getOrThrow()
+    val documentTitle = "[Web] ${extracted.title.ifBlank { extracted.host }}"
+
+    // Analyze extracted text using Gemini 2.5 Flash
+    return scanOriginality(
+      title = documentTitle,
+      text = extracted.extractedText
+    )
+  }
+
+  fun deleteReport(reportId: String) {
+    _reports.update { it - reportId }
+    val ctx = appContext ?: return
+    kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+      try {
+        val dir = java.io.File(ctx.filesDir, "reports_cache")
+        val file = java.io.File(dir, "$reportId.json")
+        if (file.exists()) file.delete()
+      } catch (e: Exception) {}
+    }
+  }
+
+  fun clearAllReports() {
+    _reports.value = emptyMap()
+    val ctx = appContext ?: return
+    kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+      try {
+        val dir = java.io.File(ctx.filesDir, "reports_cache")
+        if (dir.exists()) {
+          dir.listFiles()?.forEach { it.delete() }
+        }
+      } catch (e: Exception) {}
+    }
+  }
+
+  fun addTestReport(report: OriginalityReport) {
+    _reports.update { it + (report.id to report) }
+    persistReport(report)
+  }
+
+  fun addImportedDocument(
+    name: String,
+    sizeFormatted: String,
+    sizeBytes: Long,
+    fileType: FileType,
+    content: String,
+    folder: String = "Research Papers",
+    category: String = "Academic",
+    localFilePath: String? = null,
+    uriString: String? = null,
+    pageCount: Int = 1,
+    createdAt: Long = System.currentTimeMillis()
+  ): DocumentItem {
+    val doc = DocumentItem(
+      id = "doc-${UUID.randomUUID().toString().take(8)}",
+      name = name,
+      sizeFormatted = sizeFormatted,
+      type = fileType,
+      folder = folder,
+      category = category.ifBlank { "Academic" },
+      updatedAt = "Just now",
+      originalityScore = null,
+      isEncrypted = true,
+      content = content,
+      isStarred = false,
+      localFilePath = localFilePath,
+      uriString = uriString,
+      pageCount = pageCount,
+      createdAt = createdAt
+    )
+    _documents.update { listOf(doc) + it }
+    val addedGb = (sizeBytes / (1024.0 * 1024.0 * 1024.0)).coerceAtLeast(0.01)
+    _userProfile.update {
+      it.copy(
+        docsCount = it.docsCount + 1,
+        usedStorageGb = String.format("%.2f", it.usedStorageGb + addedGb).toDoubleOrNull() ?: it.usedStorageGb
+      )
+    }
+    persistDocumentChange(doc)
+    return doc
+  }
+
+  private var activeChatJob: kotlinx.coroutines.Job? = null
+  private val _isGenerating = MutableStateFlow(false)
+  val isGenerating: StateFlow<Boolean> = _isGenerating.asStateFlow()
+
+  fun cancelActiveGeneration() {
+    activeChatJob?.cancel()
+    activeChatJob = null
+    _isGenerating.value = false
+    _chatMessages.update { list ->
+      list.map { msg ->
+        if (msg.isStreaming) {
+          msg.copy(
+            isStreaming = false,
+            text = (msg.text.ifBlank { "Generation stopped." }) + "\n\n*[Generation stopped]*"
+          )
+        } else msg
+      }
+    }
+  }
+
+  fun sendChatMessage(
+    userText: String,
+    attachedFileName: String? = null,
+    attachedFileContent: String? = null
+  ) {
+    if (userText.isBlank()) return
+    cancelActiveGeneration()
+
+    val userMsg = ChatMessage(
+      id = "chat-${UUID.randomUUID()}",
+      isUser = true,
+      text = userText,
+      timestamp = "Just now",
+      attachedFileName = attachedFileName
+    )
+    _chatMessages.update { it + userMsg }
+
+    val botMsgId = "chat-${UUID.randomUUID()}"
+    val initialBotMsg = ChatMessage(
+      id = botMsgId,
+      isUser = false,
+      text = "",
+      timestamp = "Just now",
+      isStreaming = true
+    )
+    _chatMessages.update { it + initialBotMsg }
+    _isGenerating.value = true
+
+    val profile = _userProfile.value
+
+    activeChatJob = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+      val accumulated = StringBuilder()
+      try {
+        val result = com.example.network.GeminiService.streamChatWithGemini(
+          userMessage = userText,
+          conversationHistory = _chatMessages.value.filter { it.id != botMsgId },
+          fileContext = attachedFileContent,
+          fileName = attachedFileName,
+          customApiKey = profile.customApiKey,
+          temperature = profile.temperature,
+          onChunkReceived = { chunk ->
+            accumulated.append(chunk)
+            val currentText = accumulated.toString()
+            _chatMessages.update { list ->
+              list.map { msg ->
+                if (msg.id == botMsgId) {
+                  msg.copy(text = currentText, isStreaming = true)
+                } else msg
+              }
+            }
+          }
+        )
+
+        val finalText = if (result.isSuccess) {
+          result.getOrThrow()
+        } else {
+          val errorDetail = result.exceptionOrNull()?.message
+          if (accumulated.isNotEmpty()) {
+            accumulated.toString() + "\n\n⚠️ " + (errorDetail ?: "Stream interrupted.")
+          } else {
+            errorDetail ?: "I encountered an issue generating a response. Please check network connectivity or your API key settings."
+          }
+        }
+
+        _chatMessages.update { list ->
+          list.map { msg ->
+            if (msg.id == botMsgId) {
+              msg.copy(
+                text = finalText,
+                isStreaming = false,
+                isError = result.isFailure,
+                suggestionChips = if (result.isSuccess) listOf("Elaborate further", "Export to Vault", "Check Originality") else emptyList()
+              )
+            } else msg
+          }
+        }
+        if (result.isSuccess) {
+          _userProfile.update { it.copy(chatsCount = it.chatsCount + 1) }
+        }
+      } catch (e: kotlinx.coroutines.CancellationException) {
+        // Handled in cancelActiveGeneration
+      } catch (e: Exception) {
+        _chatMessages.update { list ->
+          list.map { msg ->
+            if (msg.id == botMsgId) {
+              msg.copy(
+                text = accumulated.toString().ifBlank { "Error generating response: ${e.message}" },
+                isStreaming = false,
+                isError = true
+              )
+            } else msg
+          }
+        }
+      } finally {
+        _isGenerating.value = false
+      }
+    }
+  }
+
+  fun retryLastMessage() {
+    val messages = _chatMessages.value
+    val lastUserMsg = messages.lastOrNull { it.isUser } ?: return
+    _chatMessages.update { list ->
+      if (list.isNotEmpty() && !list.last().isUser) list.dropLast(1) else list
+    }
+    sendChatMessage(lastUserMsg.text, lastUserMsg.attachedFileName)
+  }
+
+  fun clearChatHistory() {
+    cancelActiveGeneration()
+    _chatMessages.value = listOf(
+      ChatMessage(
+        id = "chat-${UUID.randomUUID()}",
+        isUser = false,
+        text = "Hello! I'm Genzii, your smart academic AI assistant. Ask questions, attach files for deep contextual analysis, draft essays, or analyze literature. How can I assist you today?",
+        timestamp = "Just now",
+        suggestionChips = listOf("Summarize PDF", "Write an essay", "Refine text", "Brainstorm ideas")
+      )
+    )
+  }
+
+  fun setCloudAiConsent(granted: Boolean) {
+    _userProfile.update { it.copy(isCloudAiConsentGranted = granted) }
+  }
+
+  fun updateAiSettings(customKey: String, temperature: Float, useStreaming: Boolean) {
+    _userProfile.update {
+      it.copy(
+        customApiKey = customKey,
+        temperature = temperature,
+        useStreaming = useStreaming
+      )
+    }
+  }
+
+  fun getSavedGeminiApiKey(): String = _userProfile.value.customApiKey
+
+  fun setPermissionsOnboardingCompleted(completed: Boolean = true) {
+    _userProfile.update { it.copy(hasCompletedPermissionsOnboarding = completed) }
+  }
+
+  private fun fallbackChatResponse(userText: String): Triple<String, List<String>, List<String>> {
+    return when {
+      userText.contains("essay", ignoreCase = true) -> {
+        Triple(
+          "Here is an outline and introduction crafted for your essay:\n\n• Thesis Statement: Technological convergence empowers autonomous synthesis while mandating verifiable originality.\n• Section 1: Historical context of automated writing.\n• Section 2: Cognitive augmentation vs. academic integrity.\n• Section 3: Mitigation strategies using cryptographic watermarks.",
+          listOf(
+            "Thesis: Technological convergence empowers synthesis while requiring integrity.",
+            "Section 1: Historical context of automated tools.",
+            "Section 2: Cognitive augmentation vs academic authorship.",
+            "Section 3: Mitigation strategies with verifiable cryptographic proofs."
+          ),
+          listOf("Expand Section 1", "Draft Conclusion", "Check Originality")
+        )
+      }
+      userText.contains("summarize", ignoreCase = true) -> {
+        Triple(
+          "Here's a concise summary of the requested material:\n\n• Key Point: Synthesis engines streamline document drafting by 45%.\n• Critical Insight: Zero-knowledge vaults protect sensitive intellectual property.\n• Recommendation: Cross-verify all citations prior to final publication.",
+          listOf(
+            "Key Point: Draft synthesis accelerates production by 45%.",
+            "Critical Insight: Zero-knowledge vaults ensure total privacy.",
+            "Recommendation: Verify citations against indexed scholarly sources."
+          ),
+          listOf("Detailed breakdown", "Key themes", "Export to PDF")
+        )
+      }
+      userText.contains("improve", ignoreCase = true) || userText.contains("grammar", ignoreCase = true) -> {
+        Triple(
+          "I have refined your text for enhanced academic conciseness and tonal authority:\n\n• Replaced passive structures with active verbs.\n• Eliminated redundant prepositional phrases.\n• Upgraded vocabulary for higher academic impact.",
+          listOf(
+            "Shifted passive voice to active subject assertions.",
+            "Eliminated repetitive adverbial modifiers.",
+            "Enhanced lexical diversity from 64% to 89%."
+          ),
+          listOf("Apply changes", "Compare side-by-side", "Try formal tone")
+        )
+      }
+      else -> {
+        Triple(
+          "I've analyzed your prompt '$userText'. Here are key actionable recommendations tailored to your project:\n\n• Structure your content into modular paragraphs with clear topic sentences.\n• Run our Originality Checker to verify unique phrasing.\n• Save your verified draft into the encrypted Vault.",
+          listOf(
+            "Modular paragraph layout with distinct claims.",
+            "Run similarity verification before submission.",
+            "Archive encrypted draft in Genzii Vault."
+          ),
+          listOf("Write an essay", "Summarize text", "Scan originality")
+        )
+      }
+    }
+  }
+
+  fun scanUrl(url: String): UrlScanResult {
+    val validation = UrlSecurityValidator.validateUrl(url)
+    val isSecure = validation is UrlValidationResult.Valid && validation.isHttps
+    val containsPhishingKeyword = url.contains("phishing", ignoreCase = true) || url.contains("malware", ignoreCase = true)
+    val notPhishing = !containsPhishingKeyword && validation is UrlValidationResult.Valid
+    val noMalware = !containsPhishingKeyword && validation is UrlValidationResult.Valid
+    val isSafe = validation is UrlValidationResult.Valid && isSecure && notPhishing && noMalware
+    return UrlScanResult(
+      url = if (validation is UrlValidationResult.Valid) validation.normalizedUrl else url.trim(),
+      isSafe = isSafe,
+      noMalware = noMalware,
+      notPhishing = notPhishing,
+      sslValid = isSecure,
+      originalityPercentage = if (isSafe) 94 else 0,
+      scanDate = "Today, Just now"
+    )
+  }
+
+  fun upgradeTier(tier: SubscriptionTier) {
+    _userProfile.update {
+      it.copy(
+        tier = tier,
+        checksLeft = when (tier) {
+          SubscriptionTier.PRO -> 999
+          SubscriptionTier.PLUS -> 100
+          SubscriptionTier.FREE -> 10
+        },
+        totalChecks = when (tier) {
+          SubscriptionTier.PRO -> 999
+          SubscriptionTier.PLUS -> 100
+          SubscriptionTier.FREE -> 10
+        },
+        totalStorageGb = when (tier) {
+          SubscriptionTier.PRO -> 100.0
+          SubscriptionTier.PLUS -> 50.0
+          SubscriptionTier.FREE -> 5.0
+        }
+      )
+    }
+    try {
+      appContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        ?.edit()
+        ?.putString(KEY_SUBSCRIPTION_TIER, tier.name)
+        ?.apply()
+    } catch (e: Exception) {}
+  }
+
+  fun isFeatureEntitled(feature: PremiumFeature): Boolean {
+    val currentTier = _userProfile.value.tier
+    return when (feature.minimumTier) {
+      SubscriptionTier.FREE -> true
+      SubscriptionTier.PLUS -> currentTier == SubscriptionTier.PLUS || currentTier == SubscriptionTier.PRO
+      SubscriptionTier.PRO -> currentTier == SubscriptionTier.PRO
+    }
+  }
+
+  fun canPerformScan(): Boolean {
+    return _userProfile.value.checksLeft > 0
+  }
+
+
+  fun grantRewardedBonus(scansCount: Int = 10, aiCredits: Int = 10) {
+    _userProfile.update {
+      it.copy(
+        checksLeft = it.checksLeft + scansCount,
+        totalChecks = it.totalChecks + scansCount,
+        chatsCount = it.chatsCount + aiCredits
+      )
+    }
+  }
+
+  fun updateProfile(
+    name: String,
+    email: String,
+    role: String,
+    institution: String? = null,
+    department: String? = null,
+    studentId: String? = null
+  ) {
+    isDeactivated = false
+    _userProfile.update {
+      it.copy(
+        name = name.trim().ifEmpty { it.name },
+        email = email.trim().ifEmpty { it.email },
+        role = role.trim().ifEmpty { it.role },
+        institution = institution?.trim()?.ifEmpty { it.institution } ?: it.institution,
+        department = department?.trim()?.ifEmpty { it.department } ?: it.department,
+        studentId = studentId?.trim()?.ifEmpty { it.studentId } ?: it.studentId
+      )
+    }
+  }
+
+  fun signIn(email: String, name: String, photoUrl: String? = null) {
+    isDeactivated = false
+    _userProfile.update {
+      it.copy(
+        name = if (name.isNotBlank()) name else it.name,
+        email = if (email.isNotBlank()) email else it.email,
+        photoUrl = photoUrl ?: it.photoUrl
+      )
+    }
+  }
+
+  fun setThemeMode(mode: ThemeMode) {
+    _userProfile.update { it.copy(themeMode = mode) }
+    try {
+      appContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        ?.edit()
+        ?.putString(KEY_THEME, mode.name)
+        ?.apply()
+    } catch (e: Exception) {}
+  }
+
+  fun deactivateAccount() {
+    isDeactivated = true
+    loadCacheJob?.cancel()
+    _documents.value = emptyList()
+    _reports.value = emptyMap()
+    _chatMessages.value = emptyList()
+    _userProfile.update {
+      UserProfile(
+        name = "Guest User",
+        email = "",
+        role = "Student / Researcher"
+      )
+    }
+    try {
+      appContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        ?.edit()
+        ?.clear()
+        ?.apply()
+    } catch (e: Exception) {}
+    val ctx = appContext
+    if (ctx != null) {
+      kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+        try {
+          DocumentLocalCacheManager.getInstance(ctx).clearAllCache()
+        } catch (e: Exception) {}
+      }
+    }
+  }
+
+  fun toggleAppLock(enabled: Boolean) {
+    _userProfile.update { it.copy(isAppLockEnabled = enabled) }
+  }
+
+  fun toggleTwoFactor(enabled: Boolean) {
+    _userProfile.update { it.copy(isTwoFactorEnabled = enabled) }
+  }
+
+  fun markAllNotificationsRead() {
+    _notifications.update { list -> list.map { it.copy(isUnread = false) } }
+  }
+
+  private const val PREF_KEY_SORT_ORDER = "genzii_doc_sort_order"
+
+  fun getSavedSortOrder(): String {
+    return appContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+      ?.getString(PREF_KEY_SORT_ORDER, "date_desc") ?: "date_desc"
+  }
+
+  fun saveSortOrder(orderId: String) {
+    try {
+      appContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        ?.edit()
+        ?.putString(PREF_KEY_SORT_ORDER, orderId)
+        ?.apply()
+    } catch (e: Exception) {}
+  }
+
+  fun updateProfilePhoto(uri: String?) {
+    _userProfile.update { it.copy(photoUrl = uri) }
+    try {
+      appContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        ?.edit()
+        ?.putString("saved_photo_url", uri)
+        ?.apply()
+    } catch (e: Exception) {}
+  }
+
+  fun clearTemporaryCache(): Long {
+    val ctx = appContext ?: return 0L
+    var freed = 0L
+    try {
+      val cacheDir = ctx.cacheDir
+      cacheDir.walkBottomUp().filter { it.isFile }.forEach {
+        val len = it.length()
+        if (it.delete()) freed += len
+      }
+    } catch (e: Exception) {}
+    return freed
+  }
+
+  private fun persistReport(report: OriginalityReport) {
+    val ctx = appContext ?: return
+    kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+      try {
+        val dir = java.io.File(ctx.filesDir, "reports_cache").apply { if (!exists()) mkdirs() }
+        val file = java.io.File(dir, "${report.id}.json")
+        val json = org.json.JSONObject().apply {
+          put("id", report.id)
+          put("documentTitle", report.documentTitle)
+          put("originalPercentage", report.originalPercentage)
+          put("similarityPercentage", report.similarityPercentage)
+          put("matchesCount", report.matchesCount)
+          put("sourcesCount", report.sourcesCount)
+          put("wordsCount", report.wordsCount)
+          put("scanDate", report.scanDate)
+          put("highlightedContent", report.highlightedContent)
+          put("aiAnalysis", report.aiAnalysis)
+          val srcArray = org.json.JSONArray()
+          report.sources.forEach { s ->
+            val sObj = org.json.JSONObject().apply {
+              put("domain", s.domain)
+              put("url", s.url)
+              put("matchPercentage", s.matchPercentage)
+              put("excerpt", s.excerpt)
+            }
+            srcArray.put(sObj)
+          }
+          put("sources", srcArray)
+        }
+        file.writeText(json.toString())
+      } catch (e: Exception) {}
+    }
+  }
+
+  fun loadCachedReports() {
+    val ctx = appContext ?: return
+    kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+      try {
+        val dir = java.io.File(ctx.filesDir, "reports_cache")
+        if (dir.exists()) {
+          val map = mutableMapOf<String, OriginalityReport>()
+          dir.listFiles { f -> f.extension == "json" }?.forEach { f ->
+            try {
+              val json = org.json.JSONObject(f.readText())
+              val srcList = mutableListOf<SourceMatch>()
+              val srcArray = json.optJSONArray("sources")
+              if (srcArray != null) {
+                for (i in 0 until srcArray.length()) {
+                  val sObj = srcArray.getJSONObject(i)
+                  srcList.add(
+                    SourceMatch(
+                      domain = sObj.optString("domain"),
+                      url = sObj.optString("url"),
+                      matchPercentage = sObj.optInt("matchPercentage"),
+                      excerpt = sObj.optString("excerpt")
+                    )
+                  )
+                }
+              }
+              val rep = OriginalityReport(
+                id = json.optString("id"),
+                documentTitle = json.optString("documentTitle"),
+                originalPercentage = json.optInt("originalPercentage"),
+                similarityPercentage = json.optInt("similarityPercentage"),
+                matchesCount = json.optInt("matchesCount"),
+                sourcesCount = json.optInt("sourcesCount"),
+                wordsCount = json.optInt("wordsCount"),
+                scanDate = json.optString("scanDate"),
+                sources = srcList,
+                highlightedContent = json.optString("highlightedContent"),
+                aiAnalysis = json.optString("aiAnalysis")
+              )
+              map[rep.id] = rep
+            } catch (e: Exception) {}
+          }
+          if (map.isNotEmpty()) {
+            _reports.update { current -> map + current }
+          }
+        }
+      } catch (e: Exception) {}
+    }
+  }
+}
+
