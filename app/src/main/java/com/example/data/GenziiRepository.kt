@@ -24,6 +24,7 @@ object GenziiRepository {
     appContext = context.applicationContext
     isDeactivated = false
     GeminiUsageTracker.init(context)
+    try { com.example.data.chat.AiChatSessionRepository.getInstance(context) } catch (_: Exception) {}
     try {
       val prefs = appContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
       val savedTheme = prefs?.getString(KEY_THEME, null)
@@ -102,6 +103,9 @@ object GenziiRepository {
       try {
         DocumentLocalCacheManager.getInstance(ctx).cacheDocument(doc)
       } catch (e: Exception) {}
+      try {
+        UserDocumentRepository.getInstance(ctx).syncLocalDocument(doc)
+      } catch (e: Exception) {}
     }
   }
 
@@ -110,6 +114,9 @@ object GenziiRepository {
     kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
       try {
         DocumentLocalCacheManager.getInstance(ctx).deleteCachedDocument(id)
+      } catch (e: Exception) {}
+      try {
+        UserDocumentRepository.getInstance(ctx).deleteDocumentMetadata(id)
       } catch (e: Exception) {}
     }
   }
@@ -629,6 +636,12 @@ object GenziiRepository {
             } else msg
           }
         }
+        val ctx = appContext
+        if (ctx != null) {
+          try {
+            com.example.data.chat.AiChatSessionRepository.getInstance(ctx).recordAiMessage(finalText, isError = result.isFailure)
+          } catch (_: Exception) {}
+        }
         if (result.isSuccess) {
           _userProfile.update { it.copy(chatsCount = it.chatsCount + 1) }
         }
@@ -645,6 +658,15 @@ object GenziiRepository {
               )
             } else msg
           }
+        }
+        val ctx = appContext
+        if (ctx != null) {
+          try {
+            com.example.data.chat.AiChatSessionRepository.getInstance(ctx).recordAiMessage(
+              accumulated.toString().ifBlank { "Error generating response: ${e.message}" },
+              isError = true
+            )
+          } catch (_: Exception) {}
         }
       } finally {
         _isGenerating.value = false

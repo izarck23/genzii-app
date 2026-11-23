@@ -243,8 +243,15 @@ fun GenziiNavGraph(
     composable(Screen.Splash.route) {
       SplashScreen(
         onFinishSplash = {
-          navController.navigate(Screen.Onboarding.route) {
-            popUpTo(Screen.Splash.route) { inclusive = true }
+          val activeUser = com.example.auth.FirebaseAuthManager.getCurrentlySignedInUser()
+          if (activeUser != null) {
+            navController.navigate(Screen.Dashboard.route) {
+              popUpTo(Screen.Splash.route) { inclusive = true }
+            }
+          } else {
+            navController.navigate(Screen.Onboarding.route) {
+              popUpTo(Screen.Splash.route) { inclusive = true }
+            }
           }
         }
       )

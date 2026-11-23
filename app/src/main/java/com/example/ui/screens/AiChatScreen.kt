@@ -55,6 +55,8 @@ import com.example.model.SubscriptionTier
 import com.example.network.GeminiService
 import com.example.ui.components.GeminiUsageDashboard
 import com.example.ui.theme.*
+import com.example.data.chat.AiChatSessionRepository
+import com.example.data.chat.ChatSessionEntity
 import com.example.util.FileUtils
 import kotlinx.coroutines.launch
 
@@ -79,11 +81,21 @@ fun AiChatScreen(
   var showClearChatDialog by remember { mutableStateOf(false) }
   var showRewardedAdDialog by remember { mutableStateOf(false) }
   var showApiKeyDialog by remember { mutableStateOf(false) }
+  var showSessionThreadsSheet by remember { mutableStateOf(false) }
   var showUsageStatsSheet by remember { mutableStateOf(false) }
   val usageSummary by GenziiRepository.geminiUsageStats.collectAsState()
   val isWritingToolsUnlocked by GenziiRepository.isWritingToolsUnlockedThisSession.collectAsState()
   var showWritingToolsAdPrompt by remember { mutableStateOf(false) }
   var showRewardedAdForWriting by remember { mutableStateOf(false) }
+
+  val chatSessionRepo = remember { AiChatSessionRepository.getInstance(context) }
+  val chatSessions by chatSessionRepo.sessions.collectAsState()
+  val activeSessionId by chatSessionRepo.activeSessionId.collectAsState()
+  val roomMessages by chatSessionRepo.activeMessages.collectAsState()
+  val activeSession = remember(chatSessions, activeSessionId) {
+    chatSessions.find { it.id == activeSessionId }
+  }
+  val displayMessages = if (roomMessages.isNotEmpty()) roomMessages else messages
 
   val listState = rememberLazyListState()
   val coroutineScope = rememberCoroutineScope()
@@ -154,6 +166,10 @@ fun AiChatScreen(
     inputQuery = ""
     attachedFile = null
 
+    coroutineScope.launch {
+      chatSessionRepo.recordUserMessage(finalQuery, currAttached?.name)
+    }
+
     GenziiRepository.sendChatMessage(
       userText = finalQuery,
       attachedFileName = currAttached?.name,
@@ -161,14 +177,14 @@ fun AiChatScreen(
     )
 
     coroutineScope.launch {
-      listState.animateScrollToItem((messages.size + 1).coerceAtLeast(0))
+      listState.animateScrollToItem((displayMessages.size + 1).coerceAtLeast(0))
     }
   }
 
   // Auto scroll on new messages or streaming chunks
-  LaunchedEffect(messages.lastOrNull()?.text?.length, messages.size) {
-    if (messages.isNotEmpty()) {
-      listState.scrollToItem(messages.size - 1)
+  LaunchedEffect(displayMessages.lastOrNull()?.text?.length, displayMessages.size) {
+    if (displayMessages.isNotEmpty()) {
+      listState.scrollToItem(displayMessages.size - 1)
     }
   }
 
@@ -275,6 +291,17 @@ fun AiChatScreen(
         }
 
         Row(verticalAlignment = Alignment.CenterVertically) {
+          IconButton(
+            onClick = { showSessionThreadsSheet = true },
+            modifier = Modifier.testTag("ai_session_threads_button")
+          ) {
+            Icon(
+              imageVector = Icons.Outlined.Forum,
+              contentDescription = "Chat Threads",
+              tint = GenziiPurple
+            )
+          }
+
           IconButton(
             onClick = { showUsageStatsSheet = true },
             modifier = Modifier.testTag("ai_usage_stats_button")
@@ -561,7 +588,7 @@ fun AiChatScreen(
         verticalArrangement = Arrangement.spacedBy(14.dp),
         contentPadding = PaddingValues(vertical = 12.dp)
       ) {
-        items(messages) { msg ->
+        items(displayMessages) { msg ->
           ChatBubbleItem(
             message = msg,
             onActionChipClick = { chipText ->
@@ -807,6 +834,9 @@ fun AiChatScreen(
           Button(
             onClick = {
               GenziiRepository.clearChatHistory()
+              coroutineScope.launch {
+                chatSessionRepo.clearActiveSessionMessages()
+              }
               showClearChatDialog = false
             },
             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFE53935))
@@ -901,6 +931,138 @@ fun AiChatScreen(
           }
         }
       )
+    }
+
+    // Chat Sessions & Threads Bottom Sheet (Room persistence)
+    if (showSessionThreadsSheet) {
+      ModalBottomSheet(
+        onDismissRequest = { showSessionThreadsSheet = false },
+        sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true),
+        containerColor = MaterialTheme.colorScheme.surface,
+        modifier = Modifier.testTag("ai_session_threads_modal_sheet")
+      ) {
+        Column(
+          modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp, vertical = 12.dp)
+            .navigationBarsPadding(),
+          verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+          ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+              Icon(Icons.Outlined.Forum, contentDescription = null, tint = GenziiPurple, modifier = Modifier.size(22.dp))
+              Spacer(modifier = Modifier.width(8.dp))
+              Text(
+                text = "Chat Threads",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                fontFamily = PoppinsFontFamily
+              )
+            }
+            Button(
+              onClick = {
+                coroutineScope.launch {
+                  chatSessionRepo.createNewSession("New Academic Chat")
+                  GenziiRepository.clearChatHistory()
+                  showSessionThreadsSheet = false
+                }
+              },
+              colors = ButtonDefaults.buttonColors(containerColor = GenziiPurple),
+              shape = RoundedCornerShape(10.dp),
+              contentPadding = PaddingValues(horizontal = 12.dp, vertical = 6.dp)
+            ) {
+              Icon(Icons.Filled.Add, contentDescription = null, modifier = Modifier.size(16.dp))
+              Spacer(modifier = Modifier.width(4.dp))
+              Text("New Chat", fontSize = 12.sp)
+            }
+          }
+
+          if (chatSessions.isEmpty()) {
+            Box(
+              modifier = Modifier
+                .fillMaxWidth()
+                .padding(32.dp),
+              contentAlignment = Alignment.Center
+            ) {
+              Text(
+                text = "No previous conversations found.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontSize = 13.sp
+              )
+            }
+          } else {
+            LazyColumn(
+              modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 380.dp),
+              verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+              items(chatSessions, key = { it.id }) { session ->
+                val isSelected = session.id == activeSessionId
+                Surface(
+                  shape = RoundedCornerShape(12.dp),
+                  color = if (isSelected) GenziiPurpleContainer else MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                  border = if (isSelected) BorderStroke(1.2.dp, GenziiPurple) else null,
+                  modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable {
+                      chatSessionRepo.switchSession(session.id)
+                      showSessionThreadsSheet = false
+                    }
+                ) {
+                  Row(
+                    modifier = Modifier
+                      .fillMaxWidth()
+                      .padding(horizontal = 14.dp, vertical = 12.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                  ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                      Text(
+                        text = session.title,
+                        fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Medium,
+                        fontSize = 14.sp,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                      )
+                      Spacer(modifier = Modifier.height(2.dp))
+                      Text(
+                        text = if (session.lastSnippet.isNotBlank()) session.lastSnippet else "New chat thread",
+                        fontSize = 11.5.sp,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                      )
+                    }
+                    if (chatSessions.size > 1) {
+                      IconButton(
+                        onClick = {
+                          coroutineScope.launch {
+                            chatSessionRepo.deleteSession(session.id)
+                          }
+                        },
+                        modifier = Modifier.size(32.dp)
+                      ) {
+                        Icon(
+                          imageVector = Icons.Outlined.Delete,
+                          contentDescription = "Delete Session",
+                          tint = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f),
+                          modifier = Modifier.size(16.dp)
+                        )
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
     }
 
     // Gemini API Usage & Credit Statistics Bottom Sheet

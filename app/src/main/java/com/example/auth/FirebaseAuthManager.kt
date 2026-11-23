@@ -23,9 +23,11 @@ import androidx.credentials.CustomCredential
 import androidx.credentials.GetCredentialRequest
 import androidx.credentials.exceptions.GetCredentialCancellationException
 import androidx.credentials.exceptions.NoCredentialException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -61,7 +63,11 @@ object FirebaseAuthManager {
       null
     }
 
-  init {
+  private var isInitialized = false
+
+  fun init(context: Context) {
+    if (isInitialized) return
+    isInitialized = true
     try {
       auth?.addAuthStateListener { firebaseAuth ->
         val user = firebaseAuth.currentUser
@@ -74,10 +80,33 @@ object FirebaseAuthManager {
           val email = user.email ?: ""
           val photoUrl = user.photoUrl?.toString()
           GenziiRepository.signIn(email, displayName, photoUrl)
+          kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO).launch {
+            try {
+              com.example.data.UserProfileCloudManager.fetchAndSyncUserProfile(context, user.uid)
+            } catch (e: Exception) {
+              Log.w(TAG, "Profile sync on auth state change failed: ${e.message}")
+            }
+          }
         }
       }
+      auth?.addIdTokenListener(FirebaseAuth.IdTokenListener { fbAuth ->
+        val user = fbAuth.currentUser
+        if (user != null) {
+          Log.d(TAG, "Firebase Auth token refreshed for user: ${user.uid}")
+        }
+      })
     } catch (e: Exception) {
-      Log.e(TAG, "Failed to register authStateListener: ${e.message}", e)
+      Log.e(TAG, "Failed to register auth listeners: ${e.message}", e)
+    }
+  }
+
+  init {
+    try {
+      val user = auth?.currentUser
+      _currentUser.value = user
+      _isUserLoggedIn.value = user != null
+    } catch (e: Exception) {
+      Log.e(TAG, "Failed to inspect current user: ${e.message}", e)
     }
   }
 
